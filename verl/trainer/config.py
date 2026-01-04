@@ -55,6 +55,13 @@ class DataConfig:
     max_pixels: Optional[int] = 4194304
     filter_overlong_prompts: bool = True
     filter_overlong_prompts_workers: int = 16
+    rollout_ratio: float = 0.5  # Ratio of trajectories that use experience
+    usage_ratio: float = 1.0  # Ratio of data to use (randomly sampled)
+    val_ratio: float = 0.2
+    use_three_images: bool = False
+    dynamic_rollout_ratio_enable: bool = False
+    dynamic_rollout_ratio_target: float = 1.5
+    dynamic_rollout_ratio_min: float = 0.0
 
     def post_init(self):
         self.image_dir = get_abs_path(self.image_dir, prompt="Image directory")
@@ -136,6 +143,7 @@ class TrainerConfig:
     """file to save ray timeline"""
     find_last_checkpoint: bool = True
     """automatically find the last checkpoint in the save checkpoint path to resume training"""
+    env: Optional[dict] = None
 
     def post_init(self):
         if self.save_checkpoint_path is None:
