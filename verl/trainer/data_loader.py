@@ -20,28 +20,42 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import PreTrainedTokenizer, ProcessorMixin
 
 from ..utils.dataset import RLHFDataset, collate_fn
+from ..utils.nav_dataset import NavDataset
 from .config import DataConfig
 
 
 def create_dataloader(config: DataConfig, tokenizer: PreTrainedTokenizer, processor: Optional[ProcessorMixin]) -> None:
-    train_dataset = RLHFDataset(
-        data_path=config.train_files,
-        tokenizer=tokenizer,
-        processor=processor,
-        prompt_key=config.prompt_key,
-        answer_key=config.answer_key,
-        image_key=config.image_key,
-        video_key=config.video_key,
-        image_dir=config.image_dir,
-        video_fps=config.video_fps,
-        max_prompt_length=config.max_prompt_length,
-        truncation="right",
-        format_prompt=config.format_prompt,
-        min_pixels=config.min_pixels,
-        max_pixels=config.max_pixels,
-        filter_overlong_prompts=config.filter_overlong_prompts,
-        filter_overlong_prompts_workers=config.filter_overlong_prompts_workers,
-    )
+    if "CG-DATA" in config.train_files:
+        train_dataset = NavDataset(
+            data_path=config.train_files,
+            tokenizer=tokenizer,
+            processor=processor,
+            max_prompt_length=config.max_prompt_length,
+            split='train',
+            val_ratio=config.val_ratio,
+            rollout_ratio=config.rollout_ratio,
+            usage_ratio=config.usage_ratio,
+            use_three_images=config.use_three_images
+        )
+    else:
+        train_dataset = RLHFDataset(
+            data_path=config.train_files,
+            tokenizer=tokenizer,
+            processor=processor,
+            prompt_key=config.prompt_key,
+            answer_key=config.answer_key,
+            image_key=config.image_key,
+            video_key=config.video_key,
+            image_dir=config.image_dir,
+            video_fps=config.video_fps,
+            max_prompt_length=config.max_prompt_length,
+            truncation="right",
+            format_prompt=config.format_prompt,
+            min_pixels=config.min_pixels,
+            max_pixels=config.max_pixels,
+            filter_overlong_prompts=config.filter_overlong_prompts,
+            filter_overlong_prompts_workers=config.filter_overlong_prompts_workers,
+        )
     # use sampler for better ckpt resume
     if config.shuffle:
         train_dataloader_generator = torch.Generator()
@@ -65,23 +79,36 @@ def create_dataloader(config: DataConfig, tokenizer: PreTrainedTokenizer, proces
         drop_last=True,
     )
 
-    val_dataset = RLHFDataset(
-        data_path=config.val_files,
-        tokenizer=tokenizer,
-        processor=processor,
-        prompt_key=config.prompt_key,
-        answer_key=config.answer_key,
-        image_key=config.image_key,
-        video_key=config.video_key,
-        image_dir=config.image_dir,
-        video_fps=config.video_fps,
-        max_prompt_length=config.max_prompt_length,
-        truncation="right",
-        format_prompt=config.format_prompt,
-        min_pixels=config.min_pixels,
-        max_pixels=config.max_pixels,
-        filter_overlong_prompts=config.filter_overlong_prompts,
-    )
+    if "CG-DATA" in config.val_files:
+        val_dataset = NavDataset(
+            data_path=config.val_files,
+            tokenizer=tokenizer,
+            processor=processor,
+            max_prompt_length=config.max_prompt_length,
+            split='val',
+            val_ratio=config.val_ratio,
+            rollout_ratio=config.rollout_ratio,
+            usage_ratio=config.usage_ratio,
+            use_three_images=config.use_three_images
+        )
+    else:
+        val_dataset = RLHFDataset(
+            data_path=config.val_files,
+            tokenizer=tokenizer,
+            processor=processor,
+            prompt_key=config.prompt_key,
+            answer_key=config.answer_key,
+            image_key=config.image_key,
+            video_key=config.video_key,
+            image_dir=config.image_dir,
+            video_fps=config.video_fps,
+            max_prompt_length=config.max_prompt_length,
+            truncation="right",
+            format_prompt=config.format_prompt,
+            min_pixels=config.min_pixels,
+            max_pixels=config.max_pixels,
+            filter_overlong_prompts=config.filter_overlong_prompts,
+        )
 
     if config.val_batch_size == -1:
         val_batch_size = len(val_dataset)
