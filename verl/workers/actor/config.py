@@ -88,6 +88,8 @@ class ActorConfig:
     """clip ratio in PPO & DAPO"""
     clip_ratio_high: float = 0.3
     """clip ratio in PPO & DAPO"""
+    off_clip_ratio_high: float = 1.0
+    """clip ratio for experience-augmented samples"""
     clip_ratio_dual: float = 3.0
     """constant C in dual-clip PPO, clips when advantage < -C"""
     loss_avg_mode: str = "token"
@@ -104,10 +106,8 @@ class ActorConfig:
     """ulysses sequence parallel size"""
     use_torch_compile: bool = True
     """enable torch compile"""
-    tau_positive: float = 1.0
-    """temperature for positive tokens"""
-    tau_negative: float = 1.05
-    """temperature for negative tokens"""
+    max_cuda_memory_mb: Optional[int] = None
+    """maximum allowed CUDA memory usage per process in MB; None disables guard"""
     model: ModelConfig = field(default_factory=ModelConfig)
     optim: OptimConfig = field(default_factory=OptimConfig)
     fsdp: FSDPConfig = field(default_factory=FSDPConfig)
