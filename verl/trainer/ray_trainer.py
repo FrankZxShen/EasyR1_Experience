@@ -18,6 +18,7 @@ This trainer supports model-agonistic model initialization with huggingface.
 
 import json
 import os
+import traceback
 import uuid
 from collections import defaultdict
 from copy import deepcopy
@@ -59,6 +60,7 @@ from .metrics import (
     compute_timing_metrics,
     reduce_metrics,
 )
+from .semantic_step_evaluator import SemanticStepEvaluator
 
 
 class Role(IntEnum):
@@ -178,6 +180,13 @@ class RayPPOTrainer:
         self.train_dataloader = train_dataloader
         self.val_dataloader = val_dataloader
         self.config = config
+        try:
+            env_cfg = getattr(self.config.trainer, "env", None)
+            if env_cfg:
+                for k, v in env_cfg.items():
+                    os.environ[str(k)] = str(v)
+        except Exception:
+            pass
         self.reward_fn = reward_fn
         self.val_reward_fn = val_reward_fn
 
@@ -246,6 +255,9 @@ class RayPPOTrainer:
         config.worker.actor.optim.training_steps = self.training_steps
         config.worker.critic.optim.training_steps = self.training_steps
         print(f"Total training steps: {self.training_steps}")
+
+        # Initialize semantic step evaluator
+        # self.semantic_evaluator = SemanticStepEvaluator(self.tokenizer)
 
     def init_workers(self) -> None:
         """Init resource pool and worker group"""
@@ -569,135 +581,148 @@ class RayPPOTrainer:
         main_tqdm = tqdm(range(self.training_steps), desc="Running step", position=0)
         val_metrics: Optional[dict[str, Any]] = None
 
-        # load checkpoint before doing anything
-        self._load_checkpoint()
-        main_tqdm.update(self.global_step)
+        try:
+            self._load_checkpoint()
+            main_tqdm.update(self.global_step)
 
-        # perform validation before training
-        # currently, we only support validation using the reward_function.
-        if self.val_reward_fn is not None and self.config.trainer.val_before_train:
-            val_metrics = self._validate()
-            self.logger.log(data=val_metrics, step=self.global_step)
-            if self.config.trainer.val_only:
-                return
-
-        self.data_iterator = iter(self.train_dataloader)
-        while self.global_step < self.training_steps:
-            self.global_step += 1
-
-            metrics, timing_raw = {}, {}
-            with timer("step", timing_raw):
-                # make a batch of data
-                with timer("gen", timing_raw):
-                    self.actor_rollout_ref_wg.prepare_rollout_engine()
-                    batch = self._make_batch_data(metrics=metrics)
-                    self.actor_rollout_ref_wg.release_rollout_engine()
-
-                # balance the number of valid tokens on each dp rank.
-                # NOTE: this breaks the order of data inside the batch.
-                # Please take care when you implement group based adv computation such as GRPO and rloo
-                self._balance_batch(batch, metrics=metrics)
-
-                # compute global valid tokens
-                batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
-
-                # compute reward
-                if "token_level_scores" not in batch.batch:
-                    with timer("reward", timing_raw):
-                        reward_ref = self.reward_fn.compute_reward.remote(batch)
-
-                # recompute old_log_probs
-                with timer("old", timing_raw):
-                    old_log_probs = self.actor_rollout_ref_wg.compute_log_probs(batch)
-                    batch = batch.union(old_log_probs)
-
-                # compute ref_log_probs
-                if self.use_reference_policy:
-                    with timer("ref", timing_raw):
-                        ref_log_probs = self.actor_rollout_ref_wg.compute_ref_log_probs(batch)
-                        batch = batch.union(ref_log_probs)
-
-                # compute values
-                if self.use_critic:
-                    with timer("values", timing_raw):
-                        values = self.critic_wg.compute_values(batch)
-                        batch = batch.union(values)
-
-                with timer("adv", timing_raw):
-                    if "token_level_scores" not in batch.batch:
-                        # get token level scores asynchronously
-                        reward_tensor, reward_metrics = ray.get(reward_ref)
-                        batch.batch["token_level_scores"] = reward_tensor
-                        reward_metrics = {f"reward/{k}": v for k, v in reduce_metrics(reward_metrics).items()}
-                        metrics.update(reward_metrics)
-
-                    # apply kl penalty if available
-                    if not self.config.algorithm.use_kl_loss and self.use_reference_policy:
-                        # apply kl penalty to reward
-                        batch, kl_metrics = apply_kl_penalty(batch, self.kl_ctrl, self.config.algorithm.kl_penalty)
-                        metrics.update(kl_metrics)
-                    else:
-                        batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
-
-                    # compute advantages, executed on the driver process
-                    batch = compute_advantage(
-                        batch,
-                        adv_estimator=self.config.algorithm.adv_estimator,
-                        gamma=self.config.algorithm.gamma,
-                        lam=self.config.algorithm.lam,
-                    )
-
-                # update critic
-                if self.use_critic:
-                    with timer("update_critic", timing_raw):
-                        critic_output = self.critic_wg.update_critic(batch)
-
-                    critic_metrics = reduce_metrics(critic_output.non_tensor_batch)
-                    metrics.update(critic_metrics)
-
-                # update actor
-                if self.config.trainer.critic_warmup <= self.global_step:
-                    with timer("update_actor", timing_raw):
-                        actor_output = self.actor_rollout_ref_wg.update_actor(batch)
-
-                    actor_metrics = reduce_metrics(actor_output.non_tensor_batch)
-                    metrics.update(actor_metrics)
-
-                # validate
-                if (
-                    self.val_reward_fn is not None
-                    and self.config.trainer.val_freq > 0
-                    and self.global_step % self.config.trainer.val_freq == 0
-                ):
-                    with timer("validation", timing_raw):
-                        val_metrics = self._validate()
-
-                    metrics.update(val_metrics)
-
-                if self.config.trainer.save_freq > 0 and self.global_step % self.config.trainer.save_freq == 0:
-                    with timer("save_checkpoint", timing_raw):
-                        self._save_checkpoint()
-
-            # collect metrics
-            num_gpus = self.resource_pool_manager.get_num_gpus()
-            metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
-            metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
-            metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, num_gpus=num_gpus))
-
-            self.logger.log(data=metrics, step=self.global_step)
-            main_tqdm.update()
-
-        # perform validation after training
-        if self.val_reward_fn is not None:
-            if (
-                val_metrics is None
-                or self.config.trainer.val_freq <= 0
-                or self.global_step % self.config.trainer.val_freq != 0
-            ):
+            if self.val_reward_fn is not None and self.config.trainer.val_before_train:
                 val_metrics = self._validate()
                 self.logger.log(data=val_metrics, step=self.global_step)
+                if self.config.trainer.val_only:
+                    return
 
-            print(f"Final validation metrics:\n{convert_dict_to_str(unflatten_dict(val_metrics))}")
+            self.data_iterator = iter(self.train_dataloader)
+            while self.global_step < self.training_steps:
+                self.global_step += 1
 
-        if self.config.trainer.save_freq <= 0 or self.global_step % self.config.trainer.save_freq != 0:
-            self._save_checkpoint()
+                # Dynamic rollout_ratio adjustment
+                if self.config.data.dynamic_rollout_ratio_enable:
+                    target_score = self.config.data.dynamic_rollout_ratio_target
+                    initial_ratio = self.config.data.rollout_ratio
+                    min_ratio = self.config.data.dynamic_rollout_ratio_min
+                    current_score = max(0.0, self.best_val_reward_score)  # Ensure non-negative
+
+                    # Linear decay
+                    if target_score > 0:
+                        decay_factor = 1.0 - min(current_score, target_score) / target_score
+                    else:
+                        decay_factor = 1.0 # Should not happen if target > 0
+
+                    new_ratio = max(min_ratio, initial_ratio * decay_factor)
+
+                    # Access underlying dataset
+                    # train_dataloader is StatefulDataLoader -> .dataset
+                    if hasattr(self.train_dataloader.dataset, "rollout_ratio"):
+                        self.train_dataloader.dataset.rollout_ratio = new_ratio
+
+                metrics, timing_raw = {}, {}
+                with timer("step", timing_raw):
+                    with timer("gen", timing_raw):
+                        self.actor_rollout_ref_wg.prepare_rollout_engine()
+                        batch = self._make_batch_data(metrics=metrics)
+                        self.actor_rollout_ref_wg.release_rollout_engine()
+
+                    self._balance_batch(batch, metrics=metrics)
+
+                    batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+
+                    if "token_level_scores" not in batch.batch:
+                        with timer("reward", timing_raw):
+                            reward_ref = self.reward_fn.compute_reward.remote(batch)
+
+                    with timer("old", timing_raw):
+                        old_log_probs = self.actor_rollout_ref_wg.compute_log_probs(batch)
+                        batch = batch.union(old_log_probs)
+
+                    if self.use_reference_policy:
+                        with timer("ref", timing_raw):
+                            ref_log_probs = self.actor_rollout_ref_wg.compute_ref_log_probs(batch)
+                            batch = batch.union(ref_log_probs)
+
+                    if self.use_critic:
+                        with timer("values", timing_raw):
+                            values = self.critic_wg.compute_values(batch)
+                            batch = batch.union(values)
+
+                    with timer("adv", timing_raw):
+                        if "token_level_scores" not in batch.batch:
+                            reward_tensor, reward_metrics = ray.get(reward_ref)
+                            batch.batch["token_level_scores"] = reward_tensor
+                            reward_metrics = {f"reward/{k}": v for k, v in reduce_metrics(reward_metrics).items()}
+                            metrics.update(reward_metrics)
+
+                        if not self.config.algorithm.use_kl_loss and self.use_reference_policy:
+                            batch, kl_metrics = apply_kl_penalty(batch, self.kl_ctrl, self.config.algorithm.kl_penalty)
+                            metrics.update(kl_metrics)
+                        else:
+                            batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+
+                        batch = compute_advantage(
+                            batch,
+                            adv_estimator=self.config.algorithm.adv_estimator,
+                            gamma=self.config.algorithm.gamma,
+                            lam=self.config.algorithm.lam,
+                        )
+
+                    if self.use_critic:
+                        with timer("update_critic", timing_raw):
+                            critic_output = self.critic_wg.update_critic(batch)
+
+                        critic_metrics = reduce_metrics(critic_output.non_tensor_batch)
+                        metrics.update(critic_metrics)
+
+                    if self.config.trainer.critic_warmup <= self.global_step:
+                        with timer("update_actor", timing_raw):
+                            actor_output = self.actor_rollout_ref_wg.update_actor(batch)
+
+                        actor_metrics = reduce_metrics(actor_output.non_tensor_batch)
+                        metrics.update(actor_metrics)
+
+                    if (
+                        self.val_reward_fn is not None
+                        and self.config.trainer.val_freq > 0
+                        and self.global_step % self.config.trainer.val_freq == 0
+                    ):
+                        with timer("validation", timing_raw):
+                            val_metrics = self._validate()
+
+                        metrics.update(val_metrics)
+
+                    if self.config.trainer.save_freq > 0 and self.global_step % self.config.trainer.save_freq == 0:
+                        with timer("save_checkpoint", timing_raw):
+                            self._save_checkpoint()
+
+                num_gpus = self.resource_pool_manager.get_num_gpus()
+                metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+                metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, num_gpus=num_gpus))
+
+                self.logger.log(data=metrics, step=self.global_step)
+                main_tqdm.update()
+
+            if self.val_reward_fn is not None:
+                if (
+                    val_metrics is None
+                    or self.config.trainer.val_freq <= 0
+                    or self.global_step % self.config.trainer.val_freq != 0
+                ):
+                    val_metrics = self._validate()
+                    self.logger.log(data=val_metrics, step=self.global_step)
+
+                print(f"Final validation metrics:\n{convert_dict_to_str(unflatten_dict(val_metrics))}")
+
+            if self.config.trainer.save_freq <= 0 or self.global_step % self.config.trainer.save_freq != 0:
+                self._save_checkpoint()
+        except Exception as e:
+            err = {
+                "error/type": e.__class__.__name__,
+                "error/message": str(e),
+                "error/traceback": traceback.format_exc(),
+            }
+            try:
+                os.makedirs(self.config.trainer.save_checkpoint_path, exist_ok=True)
+                with open(os.path.join(self.config.trainer.save_checkpoint_path, "experiment_errors.jsonl"), "a") as f:
+                    f.write(json.dumps({"step": self.global_step, **err}) + "\n")
+            except Exception:
+                pass
+            raise
