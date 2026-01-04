@@ -238,5 +238,15 @@ class vLLMRollout(BaseRollout):
             non_tensor_batch = {"multi_modal_data": batch_multi_modal_data}
         else:
             non_tensor_batch = {}
+            
+        # Copy other keys from prompts.non_tensor_batch to output non_tensor_batch
+        # This is important for metadata propagation (e.g. eps_path, seed_path)
+        # for key, value in prompts.non_tensor_batch.items():
+        #      if key not in non_tensor_batch:
+        #           if self.sampling_params.n > 1:
+        #               # If we duplicated the batch, we should duplicate the metadata too
+        #               non_tensor_batch[key] = _repeat_interleave(value, self.sampling_params.n)
+        #           else:
+        #               non_tensor_batch[key] = value
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info=prompts.meta_info)
