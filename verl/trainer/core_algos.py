@@ -244,7 +244,6 @@ def compute_grpo_passk_outcome_advantage(
 
     """
     scores = token_level_rewards.sum(dim=-1)
-    advantages = torch.zeros_like(scores)
     id2score = defaultdict(list)
     id2indices = defaultdict(list)
 
@@ -259,9 +258,9 @@ def compute_grpo_passk_outcome_advantage(
         topk, topk_idx = torch.topk(rewards, k=2)
         r_max, r_second_max = topk[0], topk[1]
         i_max = id2indices[idx][topk_idx[0]]
-        advantages[i_max] = (r_max - r_second_max) / (torch.std(torch.tensor(id2score[idx])) + eps)
+        scores[i_max] = (r_max - r_second_max) / (torch.std(torch.tensor(id2score[idx])) + eps)
 
-    returns = advantages.unsqueeze(-1) * response_mask
+    returns = scores.unsqueeze(-1) * response_mask
     return returns, returns
 
 
@@ -415,10 +414,10 @@ def compute_policy_loss(
     clip_ratio_low: float,
     clip_ratio_high: float,
     clip_ratio_dual: float,
-    tau_positive: float,
-    tau_negative: float,
-    loss_type: Literal["default", "gspo", "gspo_token", "cispo", "sapo"],
+    loss_type: Literal["default", "gspo", "gspo_token", "cispo"],
     loss_avg_mode: Literal["token", "seq"],
+    exp_mask: torch.Tensor = None,
+    off_clip_ratio_high: float = 1.0,
     **kwargs,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Compute the clipped policy objective and related metrics for PPO.
@@ -440,13 +439,13 @@ def compute_policy_loss(
             The higher clip range used in DAPO. See https://arxiv.org/pdf/2503.14476
         clip_ratio_dual: (float)
             The dual clip range used in Dual-clip PPO. See https://arxiv.org/pdf/1912.09729
-        tau_positive: (float)
-            The temperature for control the positive tokens' clipping in SAPO. See https://arxiv.org/pdf/2511.20347
-        tau_negative: (float)
-            The temperature for control the negative tokens' clipping in SAPO. See https://arxiv.org/pdf/2511.20347
         loss_avg_mode: (Literal["token", "seq"])
             "token": average the loss in the whole batch
             "seq": average the loss in each sequence then average the mean of the means
+        exp_mask: `(torch.Tensor)`
+            shape: (bs, 1) or (bs, response_length). Mask indicating experience-augmented samples.
+        off_clip_ratio_high: (float)
+             The higher clip range used for experience-augmented samples.
 
     Returns:
         pg_loss: `a scalar torch.Tensor`
@@ -487,12 +486,6 @@ def compute_policy_loss(
 
     if loss_type == "cispo":
         final_pg_loss = -advantages * log_probs * clipped_ratio.detach()
-    elif loss_type == "sapo":
-        positive_token_mask =  (advantages >= 0).float()
-        negative_token_mask =  (advantages < 0).float()
-        gate_negative = 4.0 / tau_negative * torch.sigmoid(tau_negative * (ratio - 1.0))
-        gate_positive = 4.0 / tau_positive * torch.sigmoid(tau_positive * (ratio - 1.0))
-        final_pg_loss = -advantages * (positive_token_mask * gate_positive + negative_token_mask * gate_negative)
     else:
         pg_loss = -advantages * ratio  # -ratio * A
         pg_loss2 = -advantages * clipped_ratio  # -clip(ratio, 1-clip_low, 1+clip_high) * A
@@ -503,6 +496,27 @@ def compute_policy_loss(
         clipped_pg_loss_lower = torch.min(clipped_pg_loss_higher, pg_loss3)  # clip if pg_loss > pg_loss3 and adv < 0
         final_pg_loss = torch.where(advantages < 0, clipped_pg_loss_lower, clipped_pg_loss_higher)
         metrics["pg_clipfrac_lower"] = (clipped_pg_loss_higher > pg_loss3).float() * (advantages < 0).float()
+        
+        # Experience Stripping / Selective Boosting logic
+        if exp_mask is not None:
+             # Expand exp_mask if needed (e.g. from (bs, 1) to (bs, response_length))
+             if exp_mask.dim() < final_pg_loss.dim():
+                 while exp_mask.dim() < final_pg_loss.dim():
+                     exp_mask = exp_mask.unsqueeze(-1)
+                 exp_mask = exp_mask.expand_as(final_pg_loss)
+             
+             # Compute off-policy loss with boosted clip range
+             clipped_ratio_off = torch.exp(
+                torch.clamp(log_importance_ratio, np.log(1.0 - clip_ratio_low), np.log(1.0 + off_clip_ratio_high))
+             )
+             pg_loss2_off = -advantages * clipped_ratio_off
+             
+             clipped_pg_loss_higher_off = torch.max(pg_loss, pg_loss2_off)
+             clipped_pg_loss_lower_off = torch.min(clipped_pg_loss_higher_off, pg_loss3)
+             final_pg_loss_off = torch.where(advantages < 0, clipped_pg_loss_lower_off, clipped_pg_loss_higher_off)
+             
+             # Mix losses: use boosted loss for experience samples (exp_mask=1), standard loss for others
+             final_pg_loss = final_pg_loss_off * exp_mask + final_pg_loss * (1.0 - exp_mask)
 
     final_pg_loss = average_loss(final_pg_loss, response_mask, mode=loss_avg_mode)
     metrics = {k: VF.masked_mean(v, response_mask).detach().item() for k, v in metrics.items()}
