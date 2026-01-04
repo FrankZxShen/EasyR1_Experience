@@ -79,6 +79,21 @@ class FSDPWorker(Worker):
         if not dist.is_initialized():
             dist.init_process_group(backend="nccl")
 
+        try:
+            max_mb = None
+            if role in ["actor", "actor_rollout", "actor_rollout_ref"]:
+                max_mb = getattr(self.config.actor, "max_cuda_memory_mb", None)
+            elif role == "critic":
+                max_mb = getattr(self.config.actor, "max_cuda_memory_mb", None)
+            if max_mb is not None and max_mb > 0:
+                dev = torch.cuda.current_device()
+                total_bytes = torch.cuda.get_device_properties(dev).total_memory
+                total_mb = total_bytes // (1024 * 1024)
+                frac = min(1.0, max(0.05, float(max_mb) / float(total_mb)))
+                torch.cuda.set_per_process_memory_fraction(frac, device=dev)
+        except Exception:
+            pass
+
         # improve numerical stability
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
