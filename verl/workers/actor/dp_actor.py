@@ -65,6 +65,40 @@ class DataParallelPPOActor(BasePPOActor):
         else:
             self.log_probs_from_logits = VF.log_probs_from_logits
 
+        self._max_cuda_memory_mb = getattr(self.config, "max_cuda_memory_mb", None)
+
+    def _cuda_used_mb(self) -> float:
+        try:
+            free_bytes, total_bytes = torch.cuda.mem_get_info()
+            used_bytes = total_bytes - free_bytes
+            return used_bytes / (1024.0 * 1024.0)
+        except Exception:
+            return 0.0
+
+    def _effective_mbsz(self, base_mbsz: int) -> int:
+        if self._max_cuda_memory_mb is None or self._max_cuda_memory_mb <= 0:
+            return base_mbsz
+        used = self._cuda_used_mb()
+        if used > (self._max_cuda_memory_mb - 2048):
+            return max(1, base_mbsz // 2)
+        return base_mbsz
+
+    def _synced_effective_mbsz(self, base_mbsz: int) -> int:
+        if self._max_cuda_memory_mb is None or self._max_cuda_memory_mb <= 0:
+            return base_mbsz
+        try:
+            dev = torch.cuda.current_device()
+            free_bytes, total_bytes = torch.cuda.mem_get_info()
+            used_mb_local = (total_bytes - free_bytes) / (1024.0 * 1024.0)
+            used_t = torch.tensor([used_mb_local], device=dev, dtype=torch.float32)
+            dist.all_reduce(used_t, op=dist.ReduceOp.MAX)
+            used_mb = float(used_t.item())
+            if used_mb > (self._max_cuda_memory_mb - 2048):
+                return max(1, base_mbsz // 2)
+        except Exception:
+            pass
+        return base_mbsz
+
     def _forward_micro_batch(self, micro_batch: dict[str, torch.Tensor], temperature: float) -> torch.Tensor:
         """
         Returns:
@@ -195,10 +229,12 @@ class DataParallelPPOActor(BasePPOActor):
 
         data = data.select(select_keys, non_tensor_select_keys)
         if self.config.dynamic_batching:
-            max_token_len = self.config.micro_batch_size_per_device_for_experience * data.batch["input_ids"].size(-1)
+            eff_mbsz = self._synced_effective_mbsz(self.config.micro_batch_size_per_device_for_experience)
+            max_token_len = eff_mbsz * data.batch["input_ids"].size(-1)
             micro_batches, batch_idx_list = prepare_dynamic_batch(data, max_token_len=max_token_len)
         else:
-            micro_batches = data.split(self.config.micro_batch_size_per_device_for_experience)
+            eff_mbsz = self._synced_effective_mbsz(self.config.micro_batch_size_per_device_for_experience)
+            micro_batches = data.split(eff_mbsz)
 
         log_probs_lst = []
         if self.rank == 0:
@@ -208,6 +244,10 @@ class DataParallelPPOActor(BasePPOActor):
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             log_probs = self._forward_micro_batch(model_inputs, temperature=temperature)
             log_probs_lst.append(log_probs)
+            if self._max_cuda_memory_mb:
+                used = self._cuda_used_mb()
+                if used > (self._max_cuda_memory_mb - 1024):
+                    torch.cuda.empty_cache()
 
         log_probs = torch.concat(log_probs_lst, dim=0)
 
@@ -238,11 +278,13 @@ class DataParallelPPOActor(BasePPOActor):
                 dist.all_reduce(total_response_tokens, op=dist.ReduceOp.SUM)
 
                 if self.config.dynamic_batching:
+                    eff_mbsz_upd = self._synced_effective_mbsz(self.config.micro_batch_size_per_device_for_update)
                     max_input_len = mini_batch.batch["input_ids"].size(-1)
-                    max_token_len = self.config.micro_batch_size_per_device_for_update * max_input_len
+                    max_token_len = eff_mbsz_upd * max_input_len
                     micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
                 else:
-                    micro_batches = mini_batch.split(self.config.micro_batch_size_per_device_for_update)
+                    eff_mbsz_upd = self._synced_effective_mbsz(self.config.micro_batch_size_per_device_for_update)
+                    micro_batches = mini_batch.split(eff_mbsz_upd)
 
                 if self.rank == 0:
                     micro_batches = tqdm(micro_batches, desc="Update policy", position=2)
@@ -256,6 +298,7 @@ class DataParallelPPOActor(BasePPOActor):
                     # all return: (bsz, response_length)
                     log_probs = self._forward_micro_batch(model_inputs, temperature=temperature)
 
+                    exp_mask = model_inputs.get("exp_mask", None)
                     pg_loss, pg_metrics = compute_policy_loss(
                         old_log_probs=old_log_probs,
                         log_probs=log_probs,
@@ -264,10 +307,10 @@ class DataParallelPPOActor(BasePPOActor):
                         clip_ratio_low=self.config.clip_ratio_low,
                         clip_ratio_high=self.config.clip_ratio_high,
                         clip_ratio_dual=self.config.clip_ratio_dual,
-                        tau_positive=self.config.tau_positive,
-                        tau_negative=self.config.tau_negative,
                         loss_type=self.config.loss_type,
                         loss_avg_mode=self.config.loss_avg_mode,
+                        exp_mask=exp_mask,
+                        off_clip_ratio_high=self.config.off_clip_ratio_high,
                     )
                     if self.config.use_kl_loss and "ref_log_probs" in model_inputs:
                         ref_log_probs = model_inputs["ref_log_probs"]
