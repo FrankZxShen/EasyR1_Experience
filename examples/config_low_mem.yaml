@@ -41,6 +41,7 @@ worker:
     micro_batch_size_per_device_for_update: 1  # equivalent to verl's actor.ppo_micro_batch_size_per_gpu
     micro_batch_size_per_device_for_experience: 1  # equivalent to verl's rollout.log_prob_micro_batch_size_per_gpu
     max_grad_norm: 1.0
+    off_clip_ratio_high: 1.0
     padding_free: true
     dynamic_batching: true
     ulysses_size: 1
